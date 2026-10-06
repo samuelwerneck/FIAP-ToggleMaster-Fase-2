@@ -1,0 +1,178 @@
+services:
+  # ============================================================================
+  # 1. Bancos de Dados Locais (4 instâncias: 2 PostgreSQL, 1 Redis, 1 DynamoDB)
+  # ============================================================================
+
+  auth-db:
+    image: postgres:15-alpine
+    container_name: tm-auth-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: auth_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./auth-service-main/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - auth_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d auth_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app-db:
+    image: postgres:15-alpine
+    container_name: tm-app-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./docker/init-app-db.sh:/docker-entrypoint-initdb.d/01-init-app-db.sh:ro
+      - ./flag-service-main/db/init.sql:/docker-entrypoint-initdb.d/flag-init.sql:ro
+      - ./targeting-service-main/db/init.sql:/docker-entrypoint-initdb.d/targeting-init.sql:ro
+      - app_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: tm-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: tm-dynamodb-local
+    restart: unless-stopped
+    command: "-jar DynamoDBLocal.jar -sharedDb"
+    ports:
+      - "8000:8000"
+    volumes:
+      - dynamodb_data:/home/dynamodblocal/data
+    working_dir: /home/dynamodblocal
+
+  # ============================================================================
+  # 2. Microsserviços da Aplicação (5 microsserviços)
+  # ============================================================================
+
+  auth-service:
+    build:
+      context: ./auth-service-main
+      dockerfile: Dockerfile
+    container_name: tm-auth-service
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      PORT: "8001"
+      DATABASE_URL: "postgres://postgres:postgres@auth-db:5432/auth_db?sslmode=disable"
+      MASTER_KEY: "${MASTER_KEY:-admin-secreto-123}"
+    depends_on:
+      auth-db:
+        condition: service_healthy
+
+  flag-service:
+    build:
+      context: ./flag-service-main
+      dockerfile: Dockerfile
+    container_name: tm-flag-service
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      PORT: "8002"
+      DATABASE_URL: "postgres://postgres:postgres@app-db:5432/flags_db"
+      AUTH_SERVICE_URL: "http://auth-service:8001"
+    depends_on:
+      app-db:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+
+  targeting-service:
+    build:
+      context: ./targeting-service-main
+      dockerfile: Dockerfile
+    container_name: tm-targeting-service
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    environment:
+      PORT: "8003"
+      DATABASE_URL: "postgres://postgres:postgres@app-db:5432/targeting_db"
+      AUTH_SERVICE_URL: "http://auth-service:8001"
+    depends_on:
+      app-db:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+
+  evaluation-service:
+    build:
+      context: ./evaluation-service-main
+      dockerfile: Dockerfile
+    container_name: tm-evaluation-service
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    environment:
+      PORT: "8004"
+      REDIS_URL: "redis://redis:6379"
+      FLAG_SERVICE_URL: "http://flag-service:8002"
+      TARGETING_SERVICE_URL: "http://targeting-service:8003"
+      SERVICE_API_KEY: "${SERVICE_API_KEY:-}"
+      AWS_SQS_URL: "${AWS_SQS_URL:-}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+    depends_on:
+      redis:
+        condition: service_healthy
+      flag-service:
+        condition: service_started
+      targeting-service:
+        condition: service_started
+
+  analytics-service:
+    build:
+      context: ./analytics-service-main
+      dockerfile: Dockerfile
+    container_name: tm-analytics-service
+    restart: unless-stopped
+    ports:
+      - "8005:8005"
+    environment:
+      PORT: "8005"
+      AWS_SQS_URL: "${AWS_SQS_URL:-}"
+      AWS_DYNAMODB_TABLE: "${AWS_DYNAMODB_TABLE:-ToggleMasterAnalytics}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-fakeMyKeyId}"
+      AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-fakeSecretAccessKey}"
+      AWS_SESSION_TOKEN: "${AWS_SESSION_TOKEN:-}"
+      DYNAMODB_ENDPOINT_URL: "http://dynamodb-local:8000"
+    depends_on:
+      - dynamodb-local
+
+volumes:
+  auth_db_data:
+  app_db_data:
+  redis_data:
+  dynamodb_data:
