@@ -102,3 +102,18 @@ Este registro serve como subsídio direto para o relatório de entrega e para o 
   * Provisionamos a fila Standard `togglemaster-events` no console da AWS na região `us-east-1`.
   * Mapeamos as credenciais temporárias do AWS Academy (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) e a `AWS_SQS_URL` no arquivo centralizado `.env`.
   * O teste funcional confirmou o ciclo completo: o `evaluation-service` publica eventos de avaliação na AWS SQS via internet, e o worker em background do `analytics-service` consome as mensagens da AWS em tempo real e persiste os dados no DynamoDB Local.
+
+---
+
+### 8. Autenticação SCRAM no PostgreSQL 15 vs. Libpq em ARM64 (`psycopg2-binary`)
+
+* **Contexto:** Ao executar os microsserviços Python (`flag-service` e `targeting-service`) no Raspberry Pi 5 (ARM64), os processos falhavam continuamente na inicialização com a mensagem:
+  ```text
+  CRITICAL:app:Erro fatal ao conectar ao PostgreSQL: SCRAM authentication requires libpq version 10 or above
+  ```
+* **Impasse Técnico:** O PostgreSQL 15 adota `SCRAM-SHA-256` por padrão para autenticação segura de senhas. A versão antiga `psycopg2-binary==2.9.5` fornecida utilizava uma compilação de binários para Linux ARM64 vinculada a uma biblioteca C `libpq` desatualizada (< versão 10), incompatível com o algoritmo SCRAM.
+* **Decisão & Solução Adotada:**
+  * Atualizamos a dependência nos arquivos `requirements.txt` do `flag-service` e `targeting-service` para `psycopg2-binary>=2.9.9` (que empacota a `libpq 16` moderna com suporte nativo total a SCRAM em ARM64).
+  * Incluímos o pacote de runtime `libpq5` nos respectivos `Dockerfile`s.
+  * Essa correção é vital tanto para o Raspberry Pi 5 quanto para a futura implantação em produção na nuvem com o AWS RDS PostgreSQL.
+
