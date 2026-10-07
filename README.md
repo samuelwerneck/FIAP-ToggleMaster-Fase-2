@@ -117,3 +117,135 @@ Este registro serve como subsídio direto para o relatório de entrega e para o 
   * Incluímos o pacote de runtime `libpq5` nos respectivos `Dockerfile`s.
   * Essa correção é vital tanto para o Raspberry Pi 5 quanto para a futura implantação em produção na nuvem com o AWS RDS PostgreSQL.
 
+---
+
+## 🚀 FASE 2: Infraestrutura Cloud e Publicação no AWS ECR
+
+Esta seção documenta a transição do ambiente local conteinerizado para a nuvem da AWS, cobrindo as decisões de arquitetura, configuração do ambiente CLI, criação de banco NoSQL e o processo de build e publicação dos microsserviços no **AWS Elastic Container Registry (ECR)**.
+
+---
+
+### 1. Decisão Técnica: Automação via AWS CLI vs. Console Web
+
+* **Contexto:** A criação manual de múltiplos repositórios e serviços via interface web (Console AWS) é propensa a erros de digitação, exige navegação excessiva de telas e não é reprodutível. Além disso, a futura conexão do `kubectl` com o cluster EKS exigirá o AWS CLI nativo na máquina de desenvolvimento.
+* **Decisão & Benefícios:**
+  * Adotamos o **AWS CLI v2** instalado diretamente no host Linux para automatizar todo o provisionamento de recursos serverless e a autenticação do Docker.
+  * O CLI consome as APIs públicas da AWS de forma idêntica ao console, permitindo criar múltiplos repositórios e validar o status de recursos com laços de repetição em segundos.
+
+**Instalação do AWS CLI v2:**
+```bash
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+unzip -q /tmp/awscliv2.zip -d /tmp
+sudo /tmp/aws/install
+aws --version
+```
+
+---
+
+### 2. Autenticação com Credenciais do AWS Academy Learner Lab
+
+* **Contexto:** No ambiente do AWS Academy, o identificador de conta (`Account ID`) permanece fixo durante todo o curso, enquanto as credenciais de sessão expiram periodicamente (a cada 4 horas).
+* **Solução:** Centralizamos as credenciais no arquivo `.env` e as exportamos para a sessão do terminal de trabalho antes de qualquer operação:
+
+```bash
+# Carregar credenciais do .env
+set -a
+source .env
+set +a
+
+# Validar identidade e permissões da sessão (LabRole)
+aws sts get-caller-identity
+```
+
+---
+
+### 3. Provisionamento do DynamoDB na AWS (`ToggleMasterAnalytics`)
+
+* **Contexto:** O `analytics-service` consome eventos de telemetria da fila SQS e persiste o histórico em uma tabela NoSQL DynamoDB.
+* **Decisão & Otimização de Custos:**
+  * Provisionamos a tabela explicitamente na região `us-east-1` utilizando a chave de partição `event_id` (tipo String `S`).
+  * Configuramos a cobrança como **`PAY_PER_REQUEST` (On-Demand)**. Essa escolha é essencial para o laboratório do Academy, pois zera custos fixos de capacidade provisionada (RCU/WCU) e preserva o teto de orçamento ($100).
+
+```bash
+# Criação da tabela
+aws dynamodb create-table \
+    --table-name ToggleMasterAnalytics \
+    --attribute-definitions AttributeName=event_id,AttributeType=S \
+    --key-schema AttributeName=event_id,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST \
+    --region us-east-1
+
+# Verificação do status (deve retornar "ACTIVE")
+aws dynamodb describe-table --table-name ToggleMasterAnalytics --query "Table.TableStatus"
+```
+
+---
+
+### 4. Criação dos Repositórios no AWS ECR
+
+* **Contexto:** O cluster Kubernetes (EKS) precisará baixar as imagens de contêiner de um registro privado e seguro dentro da própria conta da AWS.
+* **Solução:** Criamos 5 repositórios dedicados no ECR (um para cada microsserviço) via laço no terminal:
+
+```bash
+# Criar os 5 repositórios no ECR
+for repo in auth-service flag-service targeting-service evaluation-service analytics-service; do
+  aws ecr create-repository --repository-name $repo --region us-east-1
+done
+
+# Listar e validar a criação dos repositórios
+aws ecr describe-repositories --query "repositories[].repositoryName" --output table
+```
+
+---
+
+### 5. Autenticação do Docker Daemon no Registro Privado ECR
+
+* **Contexto:** Por motivos de segurança, o daemon do Docker local precisa de um token de autorização temporário emitido pelo IAM da AWS para conseguir enviar imagens para o ECR.
+* **Solução:** Obtivemos o token de autenticação via AWS CLI e direcionamos diretamente para o `docker login`:
+
+```bash
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com
+```
+
+---
+
+### 6. Compilação Limpa (x86_64) e Envio das Imagens (`docker push`)
+
+* **Atenção à Paridade de Arquitetura (ARM64 vs. x86_64):**
+  * Enquanto nosso ambiente de testes locais utilizou o **Raspberry Pi 5 (ARM64)**, os nós de trabalho padrão do Kubernetes no AWS EKS (como instâncias `t3.medium`) utilizam arquitetura **x86_64 (amd64)**.
+  * O envio de imagens compiladas exclusivamente para ARM64 provocaria falhas fatais (`exec format error` / `CrashLoopBackOff`) nos pods do EKS.
+  * Por isso, a compilação final e o envio foram executados no computador x86_64, garantindo imagens 100% nativas para o cluster em nuvem.
+* **Processo Layer-by-Layer:**
+  * O Docker envia cada camada separadamente, aproveitando o cache de imagens base idênticas (`Layer already exists`), otimizando o tráfego de rede e o armazenamento no ECR.
+
+```bash
+# 1. Limpeza de builds locais antigos
+docker rmi -f $(docker images "*togglemaster*" -q) 2>/dev/null || true
+
+# 2. Definição do registro oficial
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com"
+
+# 3. Build dos 5 microsserviços já com as tags do ECR
+docker build -t ${REGISTRY}/auth-service:latest ./auth-service-main
+docker build -t ${REGISTRY}/flag-service:latest ./flag-service-main
+docker build -t ${REGISTRY}/targeting-service:latest ./targeting-service-main
+docker build -t ${REGISTRY}/evaluation-service:latest ./evaluation-service-main
+docker build -t ${REGISTRY}/analytics-service:latest ./analytics-service-main
+
+# 4. Upload das imagens para o AWS ECR
+for repo in auth-service flag-service targeting-service evaluation-service analytics-service; do
+  echo "--- Enviando $repo para a AWS ---"
+  docker push ${REGISTRY}/${repo}:latest
+done
+
+# 5. Verificação das tags enviadas no ECR (todas devem exibir 'latest')
+for repo in auth-service flag-service targeting-service evaluation-service analytics-service; do
+  echo "--- Imagens no ECR: $repo ---"
+  aws ecr list-images --repository-name $repo --query "imageIds[*].imageTag" --output text
+done
+```
+
+
