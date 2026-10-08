@@ -248,4 +248,147 @@ for repo in auth-service flag-service targeting-service evaluation-service analy
 done
 ```
 
+---
+
+## 🚀 FASE 3: Orquestração no Kubernetes (AWS EKS), Bancos Gerenciados e Deploy E2E
+
+Esta seção documenta a conclusão integral da Fase 2 do Tech Challenge: o provisionamento do cluster Kubernetes na AWS (**EKS**), instâncias relacionais (**RDS PostgreSQL**), cache em memória (**ElastiCache Redis**), ingress controller com **AWS Load Balancer**, auto-escalabilidade com **HPA**, resolução dos impasses técnicos de conectividade e validação ponta a ponta.
+
+---
+
+### 1. Resumo da Arquitetura Implantada
+
+* **Plano de Controle Kubernetes:** 1 Cluster AWS EKS (`togglemaster-cluster`) com versão estável do Kubernetes (1.36), endpoint público/privado e utilizando a `LabRole`.
+* **Nós de Computação (Worker Nodes):** 1 Managed Node Group (`togglemaster-nodes`) composto por instâncias EC2 `t3.medium`, escalabilidade configurada (Mínimo=1, Desejado=2, Máximo=4) e perfil de nó vinculado à `LabRole`.
+* **Bancos Relacionais Gerenciados (RDS):** 3 instâncias independentes de PostgreSQL (`auth-db`, `flag-db`, `targeting-db`) em instâncias econômicas `db.t3.micro` alocadas no `togglemaster-db-subnet-group`.
+* **Cache em Memória (ElastiCache):** 1 cluster Redis (`evaluation-redis`) com nó `cache.t3.micro` alocado no `togglemaster-redis-subnet-group`.
+* **Balanceamento e Roteamento Externo:** **Nginx Ingress Controller** implantado, provisionando automaticamente um **Application Load Balancer (ELB)** público na AWS.
+* **Métricas e Escalabilidade:** **Metrics Server** implantado e **HorizontalPodAutoscaler (HPA)** configurado para autoscaling automático baseado em CPU (>70%) para os microsserviços.
+
+---
+
+### 2. Dificuldades Técnicas Encontradas e Soluções Adotadas
+
+Durante a implantação na nuvem, nos deparamos com 6 desafios práticos de engenharia e conectividade distribuída, todos solucionados exclusivamente em nível de infraestrutura e variáveis de ambiente, sem alterar o código-fonte das aplicações:
+
+#### Desafio 1: Incompatibilidade do "EKS Auto Mode" com a `LabRole` no AWS Academy
+* **Problema:** Ao iniciar a criação do cluster EKS no Console da AWS, a interface sugeriu por padrão a ativação do novo "EKS Auto Mode". No entanto, o console disparou alertas de permissão ausente (`AmazonEKSComputePolicy`, `sts:TagSession`), bloqueando o avanço.
+* **Causa Raiz:** O Modo Automático exige políticas gerenciadas modernas que a `LabRole` da conta acadêmica não possui e o estudante não tem privilégios de IAM para anexar.
+* **Solução:** Desabilitamos manualmente o EKS Auto Mode, selecionando a configuração padrão do cluster com **Managed Node Group**, conforme orientado nas diretrizes da Opção A do roteiro.
+
+#### Desafio 2: Esquemas de Banco Ausentes nas Novas Instâncias AWS RDS
+* **Problema:** Ao provisionar as instâncias RDS PostgreSQL gerenciadas, os bancos nascem limpos e sem nenhuma tabela criada. Diferente do ambiente Docker Compose local (onde o script `init-app-db.sh` executava no volume de inicialização), os microsserviços no EKS falhavam ao buscar as tabelas `api_keys`, `flags` e `targeting_rules`.
+* **Solução:** Criamos um manifesto declarativo de Job do Kubernetes (`k8s/02b-init-rds-job.yaml`) com a imagem `postgres:15-alpine`. Esse Job rodou um pod efêmero dentro do cluster, conectou nas 3 instâncias RDS via rede interna e aplicou com sucesso todos os comandos DDL (`CREATE TABLE`, funções e *triggers* de atualização temporal).
+
+#### Desafio 3: Bloqueio de Tráfego entre Security Groups da VPC (EKS $\rightarrow$ RDS)
+* **Problema:** O Job de inicialização e os pods dos serviços sofriam *timeout* contínuo tentando se conectar aos endpoints do RDS e do ElastiCache.
+* **Causa Raiz:** O assistente de criação do EKS criou um Security Group exclusivo para os nós de computação (`eks-cluster-sg-...`), enquanto os bancos RDS foram associados ao grupo padrão `default` (`sg-005a...`). O grupo de segurança do banco não permitia conexões de entrada originadas do grupo de nós do Kubernetes.
+* **Solução:** Autorizamos uma regra de *ingress* no Security Group padrão permitindo o tráfego interno da faixa CIDR da VPC (`172.31.0.0/16`):
+  ```bash
+  aws ec2 authorize-security-group-ingress --group-id sg-005a0c0734a7bc794 --protocol all --cidr 172.31.0.0/16 --region us-east-1
+  ```
+  Isso liberou a comunicação imediata em todas as portas internas (5432 para Postgres e 6379 para Redis).
+
+#### Desafio 4: Rejeição de Conexão Não-Criptografada no RDS PostgreSQL (`auth-service`)
+* **Problema:** O pod do `auth-service` (Go) entrou em *CrashLoopBackOff* com a mensagem:
+  ```text
+  FATAL: no pg_hba.conf entry for host "...", user "auth_user", database "auth_db", no encryption (SQLSTATE 28000)
+  ```
+* **Causa Raiz:** A string de conexão herdada do ambiente local utilizava o parâmetro `?sslmode=disable`. O AWS RDS PostgreSQL impõe por padrão conexões com criptografia TLS/SSL ativa.
+* **Solução:** Alteramos a variável de ambiente para `?sslmode=require` e regeneramos as Secrets do Kubernetes em Base64. A conexão foi estabelecida com sucesso.
+
+#### Desafio 5: Validação Estrita do Esquema de URL do Redis no Go (`evaluation-service`)
+* **Problema:** O `evaluation-service` falhou na inicialização com a mensagem:
+  ```text
+  Não foi possível parsear a URL do Redis: redis: invalid URL scheme: evaluation-redis...
+  ```
+* **Causa Raiz:** O cliente Go `go-redis` (`redis.ParseURL`) exige que a string de conexão inclua expressamente o protocolo `redis://`. O endpoint fornecido pelo ElastiCache não inclui o prefixo por padrão.
+* **Solução:** Ajustamos a variável de ambiente no `.env` para `redis://evaluation-redis.uepywj.0001.use1.cache.amazonaws.com:6379` e reiniciamos o deployment.
+
+#### Desafio 6: Renovação da Chave de Serviço M2M na Nuvem
+* **Problema:** As chaves de API do ambiente local não existiam no novo banco `auth_db` do RDS, impedindo o `evaluation-service` de autenticar chamadas internas para o `flag-service` e `targeting-service`.
+* **Solução:** Através do Load Balancer público, realizamos a chamada administrativa `POST /admin/keys` utilizando a `MASTER_KEY`, geramos a nova credencial oficial em nuvem, injetamos seu valor na secret `SERVICE_API_KEY` e reiniciamos os pods via `kubectl rollout restart`.
+
+---
+
+### 3. Comandos Executados na Fase 3
+
+#### A. Conexão do `kubectl` e Instalação dos Componentes de Cluster:
+```bash
+# Conectar kubectl ao cluster EKS
+aws eks update-kubeconfig --region us-east-1 --name togglemaster-cluster
+
+# Instalar Metrics Server (necessário para o HPA)
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# Instalar Nginx Ingress Controller (provisiona o Load Balancer da AWS)
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.1/deploy/static/provider/aws/deploy.yaml
+```
+
+#### B. Provisionamento dos Bancos RDS e ElastiCache Redis:
+```bash
+# 1. Criação dos Subnet Groups
+aws rds create-db-subnet-group --db-subnet-group-name togglemaster-db-subnet-group --db-subnet-group-description "ToggleMaster DB Subnets" --subnet-ids subnet-0f5ecab058cb97af3 subnet-05c690bfb6ce9085b subnet-069e094bec232be6b --region us-east-1
+aws elasticache create-cache-subnet-group --cache-subnet-group-name togglemaster-redis-subnet-group --cache-subnet-group-description "ToggleMaster Redis Subnets" --subnet-ids subnet-0f5ecab058cb97af3 subnet-05c690bfb6ce9085b subnet-069e094bec232be6b --region us-east-1
+
+# 2. Criação das instâncias RDS PostgreSQL
+aws rds create-db-instance --db-instance-identifier auth-db --db-instance-class db.t3.micro --engine postgres --master-username auth_user --master-user-password "togglemasterpass123" --db-name auth_db --allocated-storage 20 --db-subnet-group-name togglemaster-db-subnet-group --vpc-security-group-ids sg-005a0c0734a7bc794 --backup-retention-period 0 --no-multi-az --region us-east-1
+aws rds create-db-instance --db-instance-identifier flag-db --db-instance-class db.t3.micro --engine postgres --master-username flag_user --master-user-password "togglemasterpass123" --db-name flags_db --allocated-storage 20 --db-subnet-group-name togglemaster-db-subnet-group --vpc-security-group-ids sg-005a0c0734a7bc794 --backup-retention-period 0 --no-multi-az --region us-east-1
+aws rds create-db-instance --db-instance-identifier targeting-db --db-instance-class db.t3.micro --engine postgres --master-username targeting_user --master-user-password "togglemasterpass123" --db-name targeting_db --allocated-storage 20 --db-subnet-group-name togglemaster-db-subnet-group --vpc-security-group-ids sg-005a0c0734a7bc794 --backup-retention-period 0 --no-multi-az --region us-east-1
+
+# 3. Criação do cluster ElastiCache Redis
+aws elasticache create-cache-cluster --cache-cluster-id evaluation-redis --engine redis --cache-node-type cache.t3.micro --num-cache-nodes 1 --cache-subnet-group-name togglemaster-redis-subnet-group --security-group-ids sg-005a0c0734a7bc794 --region us-east-1
+
+# 4. Liberação de Ingress no Security Group da VPC
+aws ec2 authorize-security-group-ingress --group-id sg-005a0c0734a7bc794 --protocol all --cidr 172.31.0.0/16 --region us-east-1
+```
+
+#### C. Aplicação Declarativa dos Manifestos Kubernetes (`k8s/`):
+```bash
+# 1. Namespace, ConfigMap e Secrets Base64
+kubectl apply -f k8s/00-namespace.yaml
+kubectl apply -f k8s/01-configmap.yaml
+bash k8s/update-secrets.sh
+kubectl apply -f k8s/02-secrets.yaml
+
+# 2. Inicialização dos esquemas nos bancos RDS
+kubectl apply -f k8s/02b-init-rds-job.yaml
+
+# 3. Deployments e Services dos 5 Microsserviços
+kubectl apply -f k8s/03-auth-service.yaml
+kubectl apply -f k8s/04-flag-service.yaml
+kubectl apply -f k8s/05-targeting-service.yaml
+kubectl apply -f k8s/06-evaluation-service.yaml
+kubectl apply -f k8s/07-analytics-service.yaml
+
+# 4. Ingress e Autoscaler (HPA)
+kubectl apply -f k8s/08-ingress.yaml
+kubectl apply -f k8s/09-hpa.yaml
+```
+
+#### D. Validação Ponta a Ponta via Load Balancer da AWS:
+```bash
+# Obter o endpoint público do Load Balancer
+ELB=$(kubectl get svc -n ingress-nginx ingress-nginx-controller -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+# 1. Gerar Chave Administrativa
+curl -s -X POST "http://${ELB}/admin/keys" \
+  -H "Authorization: Bearer admin-secreto-123" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "production-key"}'
+
+# 2. Criar Feature Flag
+curl -s -X POST "http://${ELB}/flags" \
+  -H "Authorization: Bearer <SUA_CHAVE_API>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "aws-cloud-dashboard", "description": "Dashboard EKS", "is_enabled": true}'
+
+# 3. Avaliar Feature Flag (Hot Path com Cache Redis e Disparo SQS)
+curl -s "http://${ELB}/evaluate?user_id=meu-usuario-teste&flag_name=aws-cloud-dashboard"
+
+# 4. Confirmar persistência no DynamoDB da AWS
+aws dynamodb scan --table-name ToggleMasterAnalytics --region us-east-1 --query "Items[*].{User:user_id.S, Flag:flag_name.S, Result:result.BOOL, Time:timestamp.S}" --output table
+```
+
+
 

@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evaluation-service
+  namespace: togglemaster
+  labels:
+    app: evaluation-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: evaluation-service
+  template:
+    metadata:
+      labels:
+        app: evaluation-service
+    spec:
+      containers:
+      - name: evaluation-service
+        image: 527501208244.dkr.ecr.us-east-1.amazonaws.com/evaluation-service:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8004
+        env:
+        - name: PORT
+          value: "8004"
+        - name: FLAG_SERVICE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: togglemaster-config
+              key: FLAG_SERVICE_URL
+        - name: TARGETING_SERVICE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: togglemaster-config
+              key: TARGETING_SERVICE_URL
+        - name: SERVICE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: togglemaster-secrets
+              key: SERVICE_API_KEY
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: togglemaster-secrets
+              key: REDIS_URL
+        - name: AWS_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: togglemaster-config
+              key: AWS_REGION
+        - name: AWS_SQS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: togglemaster-config
+              key: AWS_SQS_URL
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: togglemaster-secrets
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: togglemaster-secrets
+              key: AWS_SECRET_ACCESS_KEY
+        - name: AWS_SESSION_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: togglemaster-secrets
+              key: AWS_SESSION_TOKEN
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 300m
+            memory: 150Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8004
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8004
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: evaluation-service
+  namespace: togglemaster
+  labels:
+    app: evaluation-service
+spec:
+  type: ClusterIP
+  selector:
+    app: evaluation-service
+  ports:
+  - port: 8004
+    targetPort: 8004
+    protocol: TCP
